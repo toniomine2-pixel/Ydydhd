@@ -1,0 +1,75 @@
+name: eheheeg
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: Install and start Tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = Join-Path $env:RUNNER_TEMP "tailscale-setup-1.82.0-amd64.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          & $ts up --authkey="$env:TS_AUTHKEY" --hostname="gh-rdp" --unattended
+          $ip = (& $ts ip -4).Trim()
+          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Enable Remote Desktop
+        shell: pwsh
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+      - name: Create RDP user with random password
+        shell: pwsh
+        run: |
+          $upper   = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
+          $lower   = 'abcdefghijkmnopqrstuvwxyz'
+          $number  = '23456789'
+          $special = '!@#$%^&*-_=+'
+          $charSet = $upper + $lower + $number + $special
+
+          function Get-RandChar([string]$set) {
+            $set[[System.Security.Cryptography.RandomNumberGenerator]::GetInt32($set.Length)]
+          }
+
+          # Guarantee at least one Upper, Lower, Number, Special
+          $chars = @(
+            (Get-RandChar $upper), (Get-RandChar $lower),
+            (Get-RandChar $number), (Get-RandChar $special)
+          )
+          1..12 | ForEach-Object { $chars += Get-RandChar $charSet }
+          $rawPassword = -join ($chars | Sort-Object { [System.Security.Cryptography.RandomNumberGenerator]::GetInt32(1000000) })
+
+          $password   = $rawPassword
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          "RDP_CREDS=$rawPassword" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Show connection info and keep alive
+        shell: pwsh
+        run: |
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "Create a file named C:\stop.txt (or cancel the run) to end the session."
+
+          $end = (Get-Date).AddMinutes(350)
+          while ((Get-Date) -lt $end -and -not (Test-Path "C:\stop.txt")) {
+            Start-Sleep -Seconds 30
+          }
+          
